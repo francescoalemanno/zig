@@ -15,7 +15,6 @@ const log = std.log.scoped(.link);
 const gc_log = std.log.scoped(.gc);
 const mem = std.mem;
 const trace = @import("../tracy.zig").trace;
-const types = @import("Wasm/types.zig");
 const wasi_libc = @import("../wasi_libc.zig");
 
 const Air = @import("../Air.zig");
@@ -26,7 +25,6 @@ const Path = Cache.Path;
 const CodeGen = @import("../arch/wasm/CodeGen.zig");
 const Compilation = @import("../Compilation.zig");
 const Dwarf = @import("Dwarf.zig");
-const File = @import("Wasm/file.zig").File;
 const InternPool = @import("../InternPool.zig");
 const Liveness = @import("../Liveness.zig");
 const LlvmObject = @import("../codegen/llvm.zig").Object;
@@ -36,9 +34,6 @@ const Symbol = @import("Wasm/Symbol.zig");
 const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
 const ZigObject = @import("Wasm/ZigObject.zig");
-
-pub const Atom = @import("Wasm/Atom.zig");
-pub const Relocation = types.Relocation;
 
 base: link.File,
 /// Symbol name of the entry function to export
@@ -61,11 +56,9 @@ export_table: bool,
 name: []const u8,
 /// If this is not null, an object file is created by LLVM and linked with LLD afterwards.
 llvm_object: ?LlvmObject.Ptr = null,
-/// The file index of a `ZigObject`. This will only contain a valid index when a zcu exists,
-/// and the chosen backend is the Wasm backend.
-zig_object_index: File.Index = .null,
+zig_object: ?*ZigObject,
 /// List of relocatable files to be linked into the final binary.
-files: std.MultiArrayList(File.Entry) = .{},
+objects: std.ArrayListUnmanaged(Object) = .{},
 /// When importing objects from the host environment, a name must be supplied.
 /// LLVM uses "env" by default when none is given. This would be a good default for Zig
 /// to support existing code.
@@ -105,17 +98,17 @@ imported_globals_count: u32 = 0,
 /// The count of imported tables. This number will be appended
 /// to the table indexes when sections are merged.
 imported_tables_count: u32 = 0,
-/// Map of symbol locations, represented by its `types.Import`
-imports: std.AutoHashMapUnmanaged(SymbolLoc, types.Import) = .empty,
+/// Map of symbol locations, represented by its `Import`
+imports: std.AutoHashMapUnmanaged(SymbolLoc, Import) = .empty,
 /// Represents non-synthetic section entries.
 /// Used for code, data and custom sections.
 segments: std.ArrayListUnmanaged(Segment) = .empty,
 /// Maps a data segment key (such as .rodata) to the index into `segments`.
 data_segments: std.StringArrayHashMapUnmanaged(u32) = .empty,
-/// A table of `types.Segment` which provide meta data
+/// A table of `NamedSegment` which provide meta data
 /// about a data symbol such as its name where the key is
 /// the segment index, which can be found from `data_segments`
-segment_info: std.AutoArrayHashMapUnmanaged(u32, types.Segment) = .empty,
+segment_info: std.AutoArrayHashMapUnmanaged(u32, NamedSegment) = .empty,
 /// Deduplicated string table for strings used by symbols, imports and exports.
 string_table: StringTable = .{},
 
@@ -126,7 +119,7 @@ func_types: std.ArrayListUnmanaged(std.wasm.Type) = .empty,
 /// function index and the value is function.
 /// This allows us to map multiple symbols to the same function.
 functions: std.AutoArrayHashMapUnmanaged(
-    struct { file: File.Index, index: u32 },
+    struct { file: ObjectId, index: u32 },
     struct { func: std.wasm.Func, sym_index: Symbol.Index },
 ) = .{},
 /// Output global section
@@ -140,7 +133,7 @@ memories: std.wasm.Memory = .{ .limits = .{
 /// Output table section
 tables: std.ArrayListUnmanaged(std.wasm.Table) = .empty,
 /// Output export section
-exports: std.ArrayListUnmanaged(types.Export) = .empty,
+exports: std.ArrayListUnmanaged(Export) = .empty,
 /// List of initialization functions. These must be called in order of priority
 /// by the (synthetic) __wasm_call_ctors function.
 init_funcs: std.ArrayListUnmanaged(InitFuncLoc) = .empty,
@@ -154,8 +147,6 @@ entry: ?u32 = null,
 /// Note: Key is symbol location, value represents the index into the table
 function_table: std.AutoHashMapUnmanaged(SymbolLoc, u32) = .empty,
 
-/// All object files and their data which are linked into the final binary
-objects: std.ArrayListUnmanaged(File.Index) = .empty,
 /// All archive files that are lazy loaded.
 /// e.g. when an undefined symbol references a symbol from the archive.
 archives: std.ArrayListUnmanaged(Archive) = .empty,
@@ -178,7 +169,18 @@ undefs: std.AutoArrayHashMapUnmanaged(u32, SymbolLoc) = .empty,
 /// Undefined (and synthetic) symbols do not have an Atom and therefore cannot be mapped.
 symbol_atom: std.AutoHashMapUnmanaged(SymbolLoc, Atom.Index) = .empty,
 
-pub const Alignment = types.Alignment;
+/// Index into objects array or the zig object.
+pub const ObjectId = enum(u16) {
+    zig_object = std.math.maxInt(u16) - 1,
+    _,
+};
+
+/// Optional index into objects array or the zig object.
+pub const OptionalObjectId = enum(u16) {
+    zig_object = std.math.maxInt(u16) - 1,
+    none = std.math.maxInt(u16),
+    _,
+};
 
 pub const Segment = struct {
     alignment: Alignment,
@@ -208,43 +210,47 @@ pub const SymbolLoc = struct {
     /// The index of the symbol within the specified file
     index: Symbol.Index,
     /// The index of the object file where the symbol resides.
-    file: File.Index,
-
-    /// From a given location, returns the corresponding symbol in the wasm binary
-    pub fn getSymbol(loc: SymbolLoc, wasm_file: *const Wasm) *Symbol {
-        if (wasm_file.discarded.get(loc)) |new_loc| {
-            return new_loc.getSymbol(wasm_file);
-        }
-        if (wasm_file.file(loc.file)) |obj_file| {
-            return obj_file.symbol(loc.index);
-        }
-        return &wasm_file.synthetic_symbols.items[@intFromEnum(loc.index)];
-    }
-
-    /// From a given location, returns the name of the symbol.
-    pub fn getName(loc: SymbolLoc, wasm_file: *const Wasm) []const u8 {
-        if (wasm_file.discarded.get(loc)) |new_loc| {
-            return new_loc.getName(wasm_file);
-        }
-        if (wasm_file.file(loc.file)) |obj_file| {
-            return obj_file.symbolName(loc.index);
-        }
-        const sym = wasm_file.synthetic_symbols.items[@intFromEnum(loc.index)];
-        return wasm_file.string_table.get(sym.name);
-    }
-
-    /// From a given symbol location, returns the final location.
-    /// e.g. when a symbol was resolved and replaced by the symbol
-    /// in a different file, this will return said location.
-    /// If the symbol wasn't replaced by another, this will return
-    /// the given location itwasm.
-    pub fn finalLoc(loc: SymbolLoc, wasm_file: *const Wasm) SymbolLoc {
-        if (wasm_file.discarded.get(loc)) |new_loc| {
-            return new_loc.finalLoc(wasm_file);
-        }
-        return loc;
-    }
+    file: OptionalObjectId,
 };
+
+/// From a given location, returns the corresponding symbol in the wasm binary
+pub fn symbolLocSymbol(wasm: *const Wasm, loc: SymbolLoc) *Symbol {
+    if (wasm.discarded.get(loc)) |new_loc| {
+        return new_loc.getSymbol(wasm);
+    }
+    switch (loc.file) {
+        .none => return &wasm.synthetic_symbols.items[@intFromEnum(loc.index)],
+        .zig_object => return wasm.zig_object.?.symbol(loc.index),
+        _ => return wasm.objects.items[@intFromEnum(loc.file)].symbol(loc.index),
+    }
+}
+
+/// From a given location, returns the name of the symbol.
+pub fn symbolLocName(wasm: *const Wasm, loc: SymbolLoc) []const u8 {
+    if (wasm.discarded.get(loc)) |new_loc| {
+        return new_loc.getName(wasm);
+    }
+    switch (loc.file) {
+        .none => {
+            const sym = wasm.synthetic_symbols.items[@intFromEnum(loc.index)];
+            return wasm.string_table.get(sym.name);
+        },
+        .zig_object => return wasm.zig_object.?.symbolName(loc.index),
+        _ => return wasm.objects.items[@intFromEnum(loc.file)].symbolName(loc.index),
+    }
+}
+
+/// From a given symbol location, returns the final location.
+/// e.g. when a symbol was resolved and replaced by the symbol
+/// in a different file, this will return said location.
+/// If the symbol wasn't replaced by another, this will return
+/// the given location itwasm.
+pub fn symbolLocFinalLoc(wasm: *const Wasm, loc: SymbolLoc) SymbolLoc {
+    if (wasm.discarded.get(loc)) |new_loc| {
+        return new_loc.finalLoc(wasm);
+    }
+    return loc;
+}
 
 // Contains the location of the function symbol, as well as
 /// the priority itself of the initialization function.
@@ -252,7 +258,7 @@ pub const InitFuncLoc = struct {
     /// object file index in the list of objects.
     /// Unlike `SymbolLoc` this cannot be `null` as we never define
     /// our own ctors.
-    file: File.Index,
+    file: ObjectId,
     /// Symbol index within the corresponding object file.
     index: Symbol.Index,
     /// The priority in which the constructor must be called.
@@ -414,6 +420,7 @@ pub fn createEmpty(
             .enabled => defaultEntrySymbolName(wasi_exec_model),
             .named => |name| name,
         },
+        .zig_object = null,
     };
     if (use_llvm and comp.config.have_zcu) {
         wasm.llvm_object = try LlvmObject.create(arena, comp);
@@ -557,33 +564,17 @@ pub fn createEmpty(
 
     if (comp.zcu) |zcu| {
         if (!use_llvm) {
-            const index: File.Index = @enumFromInt(wasm.files.len);
-            var zig_object: ZigObject = .{
-                .index = index,
+            const zig_object = try arena.create(ZigObject);
+            wasm.zig_object = zig_object;
+            zig_object.* = .{
                 .path = try std.fmt.allocPrint(gpa, "{s}.o", .{std.fs.path.stem(zcu.main_mod.root_src_path)}),
                 .stack_pointer_sym = .null,
             };
             try zig_object.init(wasm);
-            try wasm.files.append(gpa, .{ .zig_object = zig_object });
-            wasm.zig_object_index = index;
         }
     }
 
     return wasm;
-}
-
-pub fn file(wasm: *const Wasm, index: File.Index) ?File {
-    if (index == .null) return null;
-    const tag = wasm.files.items(.tags)[@intFromEnum(index)];
-    return switch (tag) {
-        .zig_object => .{ .zig_object = &wasm.files.items(.data)[@intFromEnum(index)].zig_object },
-        .object => .{ .object = &wasm.files.items(.data)[@intFromEnum(index)].object },
-    };
-}
-
-pub fn zigObjectPtr(wasm: *Wasm) ?*ZigObject {
-    if (wasm.zig_object_index == .null) return null;
-    return &wasm.files.items(.data)[@intFromEnum(wasm.zig_object_index)].zig_object;
 }
 
 pub fn getTypeIndex(wasm: *const Wasm, func_type: std.wasm.Type) ?u32 {
@@ -610,7 +601,7 @@ pub fn addOrUpdateImport(
     /// is asserted instead.
     type_index: ?u32,
 ) !void {
-    return wasm.zigObjectPtr().?.addOrUpdateImport(wasm, name, symbol_index, lib_name, type_index);
+    return wasm.zig_object.?.addOrUpdateImport(wasm, name, symbol_index, lib_name, type_index);
 }
 
 /// For a given name, creates a new global synthetic symbol.
@@ -623,7 +614,7 @@ fn createSyntheticSymbol(wasm: *Wasm, name: []const u8, tag: Symbol.Tag) !Symbol
 
 fn createSyntheticSymbolOffset(wasm: *Wasm, name_offset: u32, tag: Symbol.Tag) !SymbolLoc {
     const sym_index: Symbol.Index = @enumFromInt(wasm.synthetic_symbols.items.len);
-    const loc: SymbolLoc = .{ .index = sym_index, .file = .null };
+    const loc: SymbolLoc = .{ .index = sym_index, .file = .none };
     const gpa = wasm.base.comp.gpa;
     try wasm.synthetic_symbols.append(gpa, .{
         .name = name_offset,
@@ -664,11 +655,11 @@ fn parseObjectFile(wasm: *Wasm, path: []const u8) !bool {
 }
 
 /// Creates a new empty `Atom` and returns its `Atom.Index`
-pub fn createAtom(wasm: *Wasm, sym_index: Symbol.Index, file_index: File.Index) !Atom.Index {
+pub fn createAtom(wasm: *Wasm, sym_index: Symbol.Index, object_index: ObjectId) !Atom.Index {
     const gpa = wasm.base.comp.gpa;
     const index: Atom.Index = @enumFromInt(wasm.managed_atoms.items.len);
     const atom = try wasm.managed_atoms.addOne(gpa);
-    atom.* = .{ .file = file_index, .sym_index = sym_index };
+    atom.* = .{ .file = object_index, .sym_index = sym_index };
     try wasm.symbol_atom.putNoClobber(gpa, atom.symbolLoc(), index);
 
     return index;
@@ -756,15 +747,18 @@ fn requiresTLSReloc(wasm: *const Wasm) bool {
     return false;
 }
 
-fn resolveSymbolsInObject(wasm: *Wasm, file_index: File.Index) !void {
+fn objectPath(wasm: *const Wasm, object_id: ObjectId) []const u8 {
+    if (object_id == .zig_object) return wasm.zig_object.?.path;
+}
+
+fn resolveSymbolsInObject(wasm: *Wasm, object_id: ObjectId) !void {
     const gpa = wasm.base.comp.gpa;
     const diags = &wasm.base.comp.link_diags;
-    const obj_file = wasm.file(file_index).?;
     log.debug("Resolving symbols in object: '{s}'", .{obj_file.path()});
 
     for (obj_file.symbols(), 0..) |symbol, i| {
         const sym_index: Symbol.Index = @enumFromInt(i);
-        const location: SymbolLoc = .{ .file = file_index, .index = sym_index };
+        const location: SymbolLoc = .{ .file = object_id, .index = sym_index };
         const sym_name = obj_file.string(symbol.name);
         if (mem.eql(u8, sym_name, "__indirect_function_table")) {
             continue;
@@ -931,9 +925,8 @@ fn resolveSymbolsInArchives(wasm: *Wasm) !void {
                 return error.FlushFailure;
             };
             object.index = @enumFromInt(wasm.files.len);
-            try wasm.files.append(gpa, .{ .object = object });
-            try wasm.objects.append(gpa, object.index);
-            try wasm.resolveSymbolsInObject(object.index);
+            try wasm.objects.append(gpa, object);
+            try wasm.resolveSymbolsInObject(wasm.objects.items.len - 1);
 
             // continue loop for any remaining undefined symbols that still exist
             // after resolving last object file
@@ -1165,7 +1158,7 @@ fn setupTLSRelocationsFunction(wasm: *Wasm) !void {
 
 fn validateFeatures(
     wasm: *const Wasm,
-    to_emit: *[@typeInfo(types.Feature.Tag).@"enum".fields.len]bool,
+    to_emit: *[@typeInfo(Feature.Tag).@"enum".fields.len]bool,
     emit_features_count: *u32,
 ) !void {
     const comp = wasm.base.comp;
@@ -1174,7 +1167,7 @@ fn validateFeatures(
     const shared_memory = comp.config.shared_memory;
     const cpu_features = target.cpu.features;
     const infer = cpu_features.isEmpty(); // when the user did not define any features, we infer them from linked objects.
-    const known_features_count = @typeInfo(types.Feature.Tag).@"enum".fields.len;
+    const known_features_count = @typeInfo(Feature.Tag).@"enum".fields.len;
 
     var allowed = [_]bool{false} ** known_features_count;
     var used = [_]u17{0} ** known_features_count;
@@ -1234,7 +1227,7 @@ fn validateFeatures(
             emit_features_count.* += @intFromBool(is_enabled);
         } else if (is_enabled and !allowed[used_index]) {
             var err = try diags.addErrorWithNotes(1);
-            try err.addMsg("feature '{}' not allowed, but used by linked object", .{@as(types.Feature.Tag, @enumFromInt(used_index))});
+            try err.addMsg("feature '{}' not allowed, but used by linked object", .{@as(Feature.Tag, @enumFromInt(used_index))});
             try err.addNote("defined in '{s}'", .{wasm.files.items(.data)[used_set >> 1].object.path});
             valid_feature_set = false;
         }
@@ -1245,7 +1238,7 @@ fn validateFeatures(
     }
 
     if (shared_memory) {
-        const disallowed_feature = disallowed[@intFromEnum(types.Feature.Tag.shared_mem)];
+        const disallowed_feature = disallowed[@intFromEnum(Feature.Tag.shared_mem)];
         if (@as(u1, @truncate(disallowed_feature)) != 0) {
             var err = try diags.addErrorWithNotes(0);
             try err.addMsg(
@@ -1255,7 +1248,7 @@ fn validateFeatures(
             valid_feature_set = false;
         }
 
-        for ([_]types.Feature.Tag{ .atomics, .bulk_memory }) |feature| {
+        for ([_]Feature.Tag{ .atomics, .bulk_memory }) |feature| {
             if (!allowed[@intFromEnum(feature)]) {
                 var err = try diags.addErrorWithNotes(0);
                 try err.addMsg("feature '{}' is not used but is required for shared-memory", .{feature});
@@ -1264,7 +1257,7 @@ fn validateFeatures(
     }
 
     if (has_tls) {
-        for ([_]types.Feature.Tag{ .atomics, .bulk_memory }) |feature| {
+        for ([_]Feature.Tag{ .atomics, .bulk_memory }) |feature| {
             if (!allowed[@intFromEnum(feature)]) {
                 var err = try diags.addErrorWithNotes(0);
                 try err.addMsg("feature '{}' is not used but is required for thread-local storage", .{feature});
@@ -1295,7 +1288,7 @@ fn validateFeatures(
             const is_required = @as(u1, @truncate(required_feature)) != 0;
             if (is_required and !object_used_features[feature_index]) {
                 var err = try diags.addErrorWithNotes(2);
-                try err.addMsg("feature '{}' is required but not used in linked object", .{@as(types.Feature.Tag, @enumFromInt(feature_index))});
+                try err.addMsg("feature '{}' is required but not used in linked object", .{@as(Feature.Tag, @enumFromInt(feature_index))});
                 try err.addNote("required by '{s}'", .{wasm.files.items(.data)[required_feature >> 1].object.path});
                 try err.addNote("missing in '{s}'", .{object.path});
                 valid_feature_set = false;
@@ -1396,7 +1389,7 @@ pub fn deinit(wasm: *Wasm) void {
     for (wasm.segment_info.values()) |segment_info| {
         gpa.free(segment_info.name);
     }
-    if (wasm.zigObjectPtr()) |zig_obj| {
+    if (wasm.zig_object) |zig_obj| {
         zig_obj.deinit(wasm);
     }
     for (wasm.objects.items) |obj_index| {
@@ -1445,7 +1438,7 @@ pub fn updateFunc(wasm: *Wasm, pt: Zcu.PerThread, func_index: InternPool.Index, 
         @panic("Attempted to compile for object format that was disabled by build configuration");
     }
     if (wasm.llvm_object) |llvm_object| return llvm_object.updateFunc(pt, func_index, air, liveness);
-    try wasm.zigObjectPtr().?.updateFunc(wasm, pt, func_index, air, liveness);
+    try wasm.zig_object.?.updateFunc(wasm, pt, func_index, air, liveness);
 }
 
 // Generate code for the "Nav", storing it in memory to be later written to
@@ -1455,12 +1448,12 @@ pub fn updateNav(wasm: *Wasm, pt: Zcu.PerThread, nav: InternPool.Nav.Index) !voi
         @panic("Attempted to compile for object format that was disabled by build configuration");
     }
     if (wasm.llvm_object) |llvm_object| return llvm_object.updateNav(pt, nav);
-    try wasm.zigObjectPtr().?.updateNav(wasm, pt, nav);
+    try wasm.zig_object.?.updateNav(wasm, pt, nav);
 }
 
 pub fn updateNavLineNumber(wasm: *Wasm, pt: Zcu.PerThread, nav: InternPool.Nav.Index) !void {
     if (wasm.llvm_object) |_| return;
-    try wasm.zigObjectPtr().?.updateNavLineNumber(pt, nav);
+    try wasm.zig_object.?.updateNavLineNumber(pt, nav);
 }
 
 /// From a given symbol location, returns its `wasm.GlobalType`.
@@ -1508,7 +1501,7 @@ fn getFunctionSignature(wasm: *const Wasm, loc: SymbolLoc) std.wasm.Type {
 /// and then returns the index to it.
 pub fn getGlobalSymbol(wasm: *Wasm, name: []const u8, lib_name: ?[]const u8) !Symbol.Index {
     _ = lib_name;
-    return wasm.zigObjectPtr().?.getGlobalSymbol(wasm.base.comp.gpa, name);
+    return wasm.zig_object.?.getGlobalSymbol(wasm.base.comp.gpa, name);
 }
 
 /// For a given `Nav`, find the given symbol index's atom, and create a relocation for the type.
@@ -1519,7 +1512,7 @@ pub fn getNavVAddr(
     nav: InternPool.Nav.Index,
     reloc_info: link.File.RelocInfo,
 ) !u64 {
-    return wasm.zigObjectPtr().?.getNavVAddr(wasm, pt, nav, reloc_info);
+    return wasm.zig_object.?.getNavVAddr(wasm, pt, nav, reloc_info);
 }
 
 pub fn lowerUav(
@@ -1529,11 +1522,11 @@ pub fn lowerUav(
     explicit_alignment: Alignment,
     src_loc: Zcu.LazySrcLoc,
 ) !codegen.GenResult {
-    return wasm.zigObjectPtr().?.lowerUav(wasm, pt, uav, explicit_alignment, src_loc);
+    return wasm.zig_object.?.lowerUav(wasm, pt, uav, explicit_alignment, src_loc);
 }
 
 pub fn getUavVAddr(wasm: *Wasm, uav: InternPool.Index, reloc_info: link.File.RelocInfo) !u64 {
-    return wasm.zigObjectPtr().?.getUavVAddr(wasm, uav, reloc_info);
+    return wasm.zig_object.?.getUavVAddr(wasm, uav, reloc_info);
 }
 
 pub fn deleteExport(
@@ -1542,7 +1535,7 @@ pub fn deleteExport(
     name: InternPool.NullTerminatedString,
 ) void {
     if (wasm.llvm_object) |_| return;
-    return wasm.zigObjectPtr().?.deleteExport(wasm, exported, name);
+    return wasm.zig_object.?.deleteExport(wasm, exported, name);
 }
 
 pub fn updateExports(
@@ -1555,12 +1548,12 @@ pub fn updateExports(
         @panic("Attempted to compile for object format that was disabled by build configuration");
     }
     if (wasm.llvm_object) |llvm_object| return llvm_object.updateExports(pt, exported, export_indices);
-    return wasm.zigObjectPtr().?.updateExports(wasm, pt, exported, export_indices);
+    return wasm.zig_object.?.updateExports(wasm, pt, exported, export_indices);
 }
 
 pub fn freeDecl(wasm: *Wasm, decl_index: InternPool.DeclIndex) void {
     if (wasm.llvm_object) |llvm_object| return llvm_object.freeDecl(decl_index);
-    return wasm.zigObjectPtr().?.freeDecl(wasm, decl_index);
+    return wasm.zig_object.?.freeDecl(wasm, decl_index);
 }
 
 /// Assigns indexes to all indirect functions.
@@ -1743,7 +1736,7 @@ fn setupInitFunctions(wasm: *Wasm) !void {
         for (object.init_funcs) |init_func| {
             const symbol = object.symtable[init_func.symbol_index];
             const ty: std.wasm.Type = if (symbol.isUndefined()) ty: {
-                const imp: types.Import = object.findImport(symbol);
+                const imp: Import = object.findImport(symbol);
                 break :ty object.func_types[imp.kind.function];
             } else ty: {
                 const func_index = symbol.index - object.imported_functions_count;
@@ -1866,7 +1859,7 @@ pub fn createFunction(
     function_body: *std.ArrayList(u8),
     relocations: *std.ArrayList(Relocation),
 ) !Symbol.Index {
-    return wasm.zigObjectPtr().?.createFunction(wasm, symbol_name, func_ty, function_body, relocations);
+    return wasm.zig_object.?.createFunction(wasm, symbol_name, func_ty, function_body, relocations);
 }
 
 /// If required, sets the function index in the `start` section.
@@ -1968,7 +1961,7 @@ fn setupImports(wasm: *Wasm) !void {
 
         // We copy the import to a new import to ensure the names contain references
         // to the internal string table, rather than of the object file.
-        const new_imp: types.Import = .{
+        const new_imp: Import = .{
             .module_name = try wasm.string_table.put(gpa, obj_file.string(import.module_name)),
             .name = try wasm.string_table.put(gpa, obj_file.string(import.name)),
             .kind = import.kind,
@@ -1984,7 +1977,7 @@ fn setupImports(wasm: *Wasm) !void {
     var it = wasm.imports.iterator();
     while (it.next()) |entry| {
         const symbol = entry.key_ptr.*.getSymbol(wasm);
-        const import: types.Import = entry.value_ptr.*;
+        const import: Import = entry.value_ptr.*;
         switch (import.kind) {
             .function => {
                 symbol.index = function_index;
@@ -2115,7 +2108,7 @@ fn mergeTypes(wasm: *Wasm) !void {
 
         if (symbol.isUndefined()) {
             log.debug("Adding type from extern function '{s}'", .{sym_loc.getName(wasm)});
-            const import: *types.Import = wasm.imports.getPtr(sym_loc) orelse continue;
+            const import: *Import = wasm.imports.getPtr(sym_loc) orelse continue;
             const original_type = obj_file.funcTypes()[import.kind.function];
             import.kind.function = try wasm.putOrGetFuncType(original_type);
         } else if (!dirty.contains(symbol.index)) {
@@ -2167,7 +2160,7 @@ fn setupExports(wasm: *Wasm) !void {
             symbol.name
         else
             try wasm.string_table.put(gpa, sym_name);
-        const exp: types.Export = if (symbol.tag == .data) exp: {
+        const exp: Export = if (symbol.tag == .data) exp: {
             const global_index = @as(u32, @intCast(wasm.imported_globals_count + wasm.wasm_globals.items.len));
             try wasm.wasm_globals.append(gpa, .{
                 .global_type = .{ .valtype = .i32, .mutable = false },
@@ -2364,7 +2357,7 @@ fn setupMemory(wasm: *Wasm) !void {
 /// From a given object's index and the index of the segment, returns the corresponding
 /// index of the segment within the final data section. When the segment does not yet
 /// exist, a new one will be initialized and appended. The new index will be returned in that case.
-pub fn getMatchingSegment(wasm: *Wasm, file_index: File.Index, symbol_index: Symbol.Index) !u32 {
+pub fn getMatchingSegment(wasm: *Wasm, file_index: ObjectId, symbol_index: Symbol.Index) !u32 {
     const comp = wasm.base.comp;
     const gpa = comp.gpa;
     const diags = &wasm.base.comp.link_diags;
@@ -2523,7 +2516,7 @@ pub fn flushModule(wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id, prog_no
     const link_libcpp = comp.config.link_libcpp;
     const wasi_exec_model = comp.config.wasi_exec_model;
 
-    if (wasm.zigObjectPtr()) |zig_object| {
+    if (wasm.zig_object) |zig_object| {
         try zig_object.flushModule(wasm, tid);
     }
 
@@ -2579,16 +2572,16 @@ pub fn flushModule(wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id, prog_no
     }
 
     if (wasm.zig_object_index != .null) {
-        try wasm.resolveSymbolsInObject(wasm.zig_object_index);
+        try wasm.resolveSymbolsInObject(.zig_object);
     }
     if (diags.hasErrors()) return error.FlushFailure;
-    for (wasm.objects.items) |object_index| {
+    for (0..wasm.objects.items.len) |object_index| {
         try wasm.resolveSymbolsInObject(object_index);
     }
     if (diags.hasErrors()) return error.FlushFailure;
 
     var emit_features_count: u32 = 0;
-    var enabled_features: [@typeInfo(types.Feature.Tag).@"enum".fields.len]bool = undefined;
+    var enabled_features: [@typeInfo(Feature.Tag).@"enum".fields.len]bool = undefined;
     try wasm.validateFeatures(&enabled_features, &emit_features_count);
     try wasm.resolveSymbolsInArchives();
     if (diags.hasErrors()) return error.FlushFailure;
@@ -2622,7 +2615,7 @@ pub fn flushModule(wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id, prog_no
 /// Writes the WebAssembly in-memory module to the file
 fn writeToFile(
     wasm: *Wasm,
-    enabled_features: [@typeInfo(types.Feature.Tag).@"enum".fields.len]bool,
+    enabled_features: [@typeInfo(Feature.Tag).@"enum".fields.len]bool,
     feature_count: u32,
     arena: Allocator,
 ) !void {
@@ -2695,7 +2688,7 @@ fn writeToFile(
 
         if (import_memory) {
             const mem_name = if (is_obj) "__linear_memory" else "memory";
-            const mem_imp: types.Import = .{
+            const mem_imp: Import = .{
                 .module_name = try wasm.string_table.put(gpa, wasm.host_name),
                 .name = try wasm.string_table.put(gpa, mem_name),
                 .kind = .{ .memory = wasm.memories.limits },
@@ -3183,7 +3176,7 @@ fn emitFeaturesSection(binary_bytes: *std.ArrayList(u8), enabled_features: []con
     try leb.writeUleb128(writer, features_count);
     for (enabled_features, 0..) |enabled, feature_index| {
         if (enabled) {
-            const feature: types.Feature = .{ .prefix = .used, .tag = @as(types.Feature.Tag, @enumFromInt(feature_index)) };
+            const feature: Feature = .{ .prefix = .used, .tag = @as(Feature.Tag, @enumFromInt(feature_index)) };
             try leb.writeUleb128(writer, @intFromEnum(feature.prefix));
             var buf: [100]u8 = undefined;
             const string = try std.fmt.bufPrint(&buf, "{}", .{feature.tag});
@@ -3320,7 +3313,7 @@ fn emitInit(writer: anytype, init_expr: std.wasm.InitExpression) !void {
     try writer.writeByte(std.wasm.opcode(.end));
 }
 
-fn emitImport(wasm: *Wasm, writer: anytype, import: types.Import) !void {
+fn emitImport(wasm: *Wasm, writer: anytype, import: Import) !void {
     const module_name = wasm.string_table.get(import.module_name);
     try leb.writeUleb128(writer, @as(u32, @intCast(module_name.len)));
     try writer.writeAll(module_name);
@@ -3800,7 +3793,7 @@ fn emitLinkSection(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
     // meta data version, which is currently '2'
     try leb.writeUleb128(writer, @as(u32, 2));
 
-    // For each subsection type (found in types.Subsection) we can emit a section.
+    // For each subsection type (found in Subsection) we can emit a section.
     // Currently, we only support emitting segment info and the symbol table.
     try wasm.emitSymbolTable(binary_bytes, symbol_table);
     try wasm.emitSegmentInfo(binary_bytes);
@@ -3812,7 +3805,7 @@ fn emitLinkSection(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
 fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: *std.AutoArrayHashMap(SymbolLoc, u32)) !void {
     const writer = binary_bytes.writer();
 
-    try leb.writeUleb128(writer, @intFromEnum(types.SubsectionType.WASM_SYMBOL_TABLE));
+    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.WASM_SYMBOL_TABLE));
     const table_offset = binary_bytes.items.len;
 
     var symbol_count: u32 = 0;
@@ -3860,7 +3853,7 @@ fn emitSymbolTable(wasm: *Wasm, binary_bytes: *std.ArrayList(u8), symbol_table: 
 
 fn emitSegmentInfo(wasm: *Wasm, binary_bytes: *std.ArrayList(u8)) !void {
     const writer = binary_bytes.writer();
-    try leb.writeUleb128(writer, @intFromEnum(types.SubsectionType.WASM_SEGMENT_INFO));
+    try leb.writeUleb128(writer, @intFromEnum(SubsectionType.WASM_SEGMENT_INFO));
     const segment_offset = binary_bytes.items.len;
 
     try leb.writeUleb128(writer, @as(u32, @intCast(wasm.segment_info.count())));
@@ -4030,22 +4023,22 @@ pub fn putOrGetFuncType(wasm: *Wasm, func_type: std.wasm.Type) !u32 {
 /// Asserts declaration has an associated `Atom`.
 /// Returns the index into the list of types.
 pub fn storeNavType(wasm: *Wasm, nav: InternPool.Nav.Index, func_type: std.wasm.Type) !u32 {
-    return wasm.zigObjectPtr().?.storeDeclType(wasm.base.comp.gpa, nav, func_type);
+    return wasm.zig_object.?.storeDeclType(wasm.base.comp.gpa, nav, func_type);
 }
 
 /// Returns the symbol index of the error name table.
 ///
 /// When the symbol does not yet exist, it will create a new one instead.
-pub fn getErrorTableSymbol(wasm_file: *Wasm, pt: Zcu.PerThread) !u32 {
-    const sym_index = try wasm_file.zigObjectPtr().?.getErrorTableSymbol(wasm_file, pt);
+pub fn getErrorTableSymbol(wasm: *Wasm, pt: Zcu.PerThread) !u32 {
+    const sym_index = try wasm.zig_object.?.getErrorTableSymbol(wasm, pt);
     return @intFromEnum(sym_index);
 }
 
 /// For a given `InternPool.DeclIndex` returns its corresponding `Atom.Index`.
 /// When the index was not found, a new `Atom` will be created, and its index will be returned.
 /// The newly created Atom is empty with default fields as specified by `Atom.empty`.
-pub fn getOrCreateAtomForNav(wasm_file: *Wasm, pt: Zcu.PerThread, nav: InternPool.Nav.Index) !Atom.Index {
-    return wasm_file.zigObjectPtr().?.getOrCreateAtomForNav(wasm_file, pt, nav);
+pub fn getOrCreateAtomForNav(wasm: *Wasm, pt: Zcu.PerThread, nav: InternPool.Nav.Index) !Atom.Index {
+    return wasm.zig_object.?.getOrCreateAtomForNav(wasm, pt, nav);
 }
 
 /// Verifies all resolved symbols and checks whether itself needs to be marked alive,
@@ -4110,3 +4103,462 @@ fn defaultEntrySymbolName(wasi_exec_model: std.builtin.WasiExecModel) []const u8
         .command => "_start",
     };
 }
+
+pub const Atom = struct {
+    /// Represents the index of the file this atom was generated from.
+    /// This is 'null' when the atom was generated by a synthetic linker symbol.
+    file: ObjectId,
+    /// symbol index of the symbol representing this atom
+    sym_index: Symbol.Index,
+    /// Size of the atom, used to calculate section sizes in the final binary
+    size: u32 = 0,
+    /// List of relocations belonging to this atom
+    relocs: std.ArrayListUnmanaged(Relocation) = .empty,
+    /// Contains the binary data of an atom, which can be non-relocated
+    code: std.ArrayListUnmanaged(u8) = .empty,
+    /// For code this is 1, for data this is set to the highest value of all segments
+    alignment: Wasm.Alignment = .@"1",
+    /// Offset into the section where the atom lives, this already accounts
+    /// for alignment.
+    offset: u32 = 0,
+    /// The original offset within the object file. This value is subtracted from
+    /// relocation offsets to determine where in the `data` to rewrite the value
+    original_offset: u32 = 0,
+    /// Previous atom in relation to this atom.
+    /// is null when this atom is the first in its order
+    prev: Atom.Index = .null,
+    /// Contains atoms local to a decl, all managed by this `Atom`.
+    /// When the parent atom is being freed, it will also do so for all local atoms.
+    locals: std.ArrayListUnmanaged(Atom.Index) = .empty,
+
+    /// Represents the index of an Atom where `null` is considered
+    /// an invalid atom.
+    pub const Index = enum(u32) {
+        null = std.math.maxInt(u32),
+        _,
+    };
+
+    /// Frees all resources owned by this `Atom`.
+    pub fn deinit(atom: *Atom, gpa: std.mem.Allocator) void {
+        atom.relocs.deinit(gpa);
+        atom.code.deinit(gpa);
+        atom.locals.deinit(gpa);
+        atom.* = undefined;
+    }
+
+    /// Sets the length of relocations and code to '0',
+    /// effectively resetting them and allowing them to be re-populated.
+    pub fn clear(atom: *Atom) void {
+        atom.relocs.clearRetainingCapacity();
+        atom.code.clearRetainingCapacity();
+    }
+
+    pub fn format(atom: Atom, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("Atom{{ .sym_index = {d}, .alignment = {d}, .size = {d}, .offset = 0x{x:0>8} }}", .{
+            @intFromEnum(atom.sym_index),
+            atom.alignment,
+            atom.size,
+            atom.offset,
+        });
+    }
+
+    /// Returns the location of the symbol that represents this `Atom`
+    pub fn symbolLoc(atom: Atom) Wasm.SymbolLoc {
+        return .{ .file = atom.file, .index = atom.sym_index };
+    }
+
+    /// Resolves the relocations within the atom, writing the new value
+    /// at the calculated offset.
+    pub fn resolveRelocs(atom: *Atom, wasm_bin: *const Wasm) void {
+        if (atom.relocs.items.len == 0) return;
+        const symbol_name = atom.symbolLoc().getName(wasm_bin);
+        log.debug("Resolving relocs in atom '{s}' count({d})", .{
+            symbol_name,
+            atom.relocs.items.len,
+        });
+
+        for (atom.relocs.items) |reloc| {
+            const value = atom.relocationValue(reloc, wasm_bin);
+            log.debug("Relocating '{s}' referenced in '{s}' offset=0x{x:0>8} value={d}", .{
+                (Wasm.SymbolLoc{ .file = atom.file, .index = @enumFromInt(reloc.index) }).getName(wasm_bin),
+                symbol_name,
+                reloc.offset,
+                value,
+            });
+
+            switch (reloc.relocation_type) {
+                .R_WASM_TABLE_INDEX_I32,
+                .R_WASM_FUNCTION_OFFSET_I32,
+                .R_WASM_GLOBAL_INDEX_I32,
+                .R_WASM_MEMORY_ADDR_I32,
+                .R_WASM_SECTION_OFFSET_I32,
+                => std.mem.writeInt(u32, atom.code.items[reloc.offset - atom.original_offset ..][0..4], @as(u32, @truncate(value)), .little),
+                .R_WASM_TABLE_INDEX_I64,
+                .R_WASM_MEMORY_ADDR_I64,
+                => std.mem.writeInt(u64, atom.code.items[reloc.offset - atom.original_offset ..][0..8], value, .little),
+                .R_WASM_GLOBAL_INDEX_LEB,
+                .R_WASM_EVENT_INDEX_LEB,
+                .R_WASM_FUNCTION_INDEX_LEB,
+                .R_WASM_MEMORY_ADDR_LEB,
+                .R_WASM_MEMORY_ADDR_SLEB,
+                .R_WASM_TABLE_INDEX_SLEB,
+                .R_WASM_TABLE_NUMBER_LEB,
+                .R_WASM_TYPE_INDEX_LEB,
+                .R_WASM_MEMORY_ADDR_TLS_SLEB,
+                => leb.writeUnsignedFixed(5, atom.code.items[reloc.offset - atom.original_offset ..][0..5], @as(u32, @truncate(value))),
+                .R_WASM_MEMORY_ADDR_LEB64,
+                .R_WASM_MEMORY_ADDR_SLEB64,
+                .R_WASM_TABLE_INDEX_SLEB64,
+                .R_WASM_MEMORY_ADDR_TLS_SLEB64,
+                => leb.writeUnsignedFixed(10, atom.code.items[reloc.offset - atom.original_offset ..][0..10], value),
+            }
+        }
+    }
+
+    /// From a given `relocation` will return the new value to be written.
+    /// All values will be represented as a `u64` as all values can fit within it.
+    /// The final value must be casted to the correct size.
+    fn relocationValue(atom: Atom, relocation: Relocation, wasm_bin: *const Wasm) u64 {
+        const target_loc = (Wasm.SymbolLoc{ .file = atom.file, .index = @enumFromInt(relocation.index) }).finalLoc(wasm_bin);
+        const symbol = target_loc.getSymbol(wasm_bin);
+        if (relocation.relocation_type != .R_WASM_TYPE_INDEX_LEB and
+            symbol.tag != .section and
+            symbol.isDead())
+        {
+            const val = atom.thombstone(wasm_bin) orelse relocation.addend;
+            return @bitCast(val);
+        }
+        switch (relocation.relocation_type) {
+            .R_WASM_FUNCTION_INDEX_LEB => return symbol.index,
+            .R_WASM_TABLE_NUMBER_LEB => return symbol.index,
+            .R_WASM_TABLE_INDEX_I32,
+            .R_WASM_TABLE_INDEX_I64,
+            .R_WASM_TABLE_INDEX_SLEB,
+            .R_WASM_TABLE_INDEX_SLEB64,
+            => return wasm_bin.function_table.get(.{ .file = atom.file, .index = @enumFromInt(relocation.index) }) orelse 0,
+            .R_WASM_TYPE_INDEX_LEB => {
+                const obj_file = wasm_bin.file(atom.file) orelse return relocation.index;
+                const original_type = obj_file.funcTypes()[relocation.index];
+                return wasm_bin.getTypeIndex(original_type).?;
+            },
+            .R_WASM_GLOBAL_INDEX_I32,
+            .R_WASM_GLOBAL_INDEX_LEB,
+            => return symbol.index,
+            .R_WASM_MEMORY_ADDR_I32,
+            .R_WASM_MEMORY_ADDR_I64,
+            .R_WASM_MEMORY_ADDR_LEB,
+            .R_WASM_MEMORY_ADDR_LEB64,
+            .R_WASM_MEMORY_ADDR_SLEB,
+            .R_WASM_MEMORY_ADDR_SLEB64,
+            => {
+                std.debug.assert(symbol.tag == .data);
+                if (symbol.isUndefined()) {
+                    return 0;
+                }
+                const va: i33 = @intCast(symbol.virtual_address);
+                return @intCast(va + relocation.addend);
+            },
+            .R_WASM_EVENT_INDEX_LEB => return symbol.index,
+            .R_WASM_SECTION_OFFSET_I32 => {
+                const target_atom_index = wasm_bin.symbol_atom.get(target_loc).?;
+                const target_atom = wasm_bin.getAtom(target_atom_index);
+                const rel_value: i33 = @intCast(target_atom.offset);
+                return @intCast(rel_value + relocation.addend);
+            },
+            .R_WASM_FUNCTION_OFFSET_I32 => {
+                if (symbol.isUndefined()) {
+                    const val = atom.thombstone(wasm_bin) orelse relocation.addend;
+                    return @bitCast(val);
+                }
+                const target_atom_index = wasm_bin.symbol_atom.get(target_loc).?;
+                const target_atom = wasm_bin.getAtom(target_atom_index);
+                const rel_value: i33 = @intCast(target_atom.offset);
+                return @intCast(rel_value + relocation.addend);
+            },
+            .R_WASM_MEMORY_ADDR_TLS_SLEB,
+            .R_WASM_MEMORY_ADDR_TLS_SLEB64,
+            => {
+                const va: i33 = @intCast(symbol.virtual_address);
+                return @intCast(va + relocation.addend);
+            },
+        }
+    }
+
+    // For a given `Atom` returns whether it has a thombstone value or not.
+    /// This defines whether we want a specific value when a section is dead.
+    fn thombstone(atom: Atom, wasm: *const Wasm) ?i64 {
+        const atom_name = atom.symbolLoc().getName(wasm);
+        if (std.mem.eql(u8, atom_name, ".debug_ranges") or std.mem.eql(u8, atom_name, ".debug_loc")) {
+            return -2;
+        } else if (std.mem.startsWith(u8, atom_name, ".debug_")) {
+            return -1;
+        }
+        return null;
+    }
+};
+
+pub const Relocation = struct {
+    /// Represents the type of the `Relocation`
+    relocation_type: RelocationType,
+    /// Offset of the value to rewrite relative to the relevant section's contents.
+    /// When `offset` is zero, its position is immediately after the id and size of the section.
+    offset: u32,
+    /// The index of the symbol used.
+    /// When the type is `R_WASM_TYPE_INDEX_LEB`, it represents the index of the type.
+    index: u32,
+    /// Addend to add to the address.
+    /// This field is only non-zero for `R_WASM_MEMORY_ADDR_*`, `R_WASM_FUNCTION_OFFSET_I32` and `R_WASM_SECTION_OFFSET_I32`.
+    addend: i32 = 0,
+
+    /// All possible relocation types currently existing.
+    /// This enum is exhaustive as the spec is WIP and new types
+    /// can be added which means that a generated binary will be invalid,
+    /// so instead we will show an error in such cases.
+    pub const RelocationType = enum(u8) {
+        R_WASM_FUNCTION_INDEX_LEB = 0,
+        R_WASM_TABLE_INDEX_SLEB = 1,
+        R_WASM_TABLE_INDEX_I32 = 2,
+        R_WASM_MEMORY_ADDR_LEB = 3,
+        R_WASM_MEMORY_ADDR_SLEB = 4,
+        R_WASM_MEMORY_ADDR_I32 = 5,
+        R_WASM_TYPE_INDEX_LEB = 6,
+        R_WASM_GLOBAL_INDEX_LEB = 7,
+        R_WASM_FUNCTION_OFFSET_I32 = 8,
+        R_WASM_SECTION_OFFSET_I32 = 9,
+        R_WASM_EVENT_INDEX_LEB = 10,
+        R_WASM_GLOBAL_INDEX_I32 = 13,
+        R_WASM_MEMORY_ADDR_LEB64 = 14,
+        R_WASM_MEMORY_ADDR_SLEB64 = 15,
+        R_WASM_MEMORY_ADDR_I64 = 16,
+        R_WASM_TABLE_INDEX_SLEB64 = 18,
+        R_WASM_TABLE_INDEX_I64 = 19,
+        R_WASM_TABLE_NUMBER_LEB = 20,
+        R_WASM_MEMORY_ADDR_TLS_SLEB = 21,
+        R_WASM_MEMORY_ADDR_TLS_SLEB64 = 25,
+
+        /// Returns true for relocation types where the `addend` field is present.
+        pub fn addendIsPresent(self: RelocationType) bool {
+            return switch (self) {
+                .R_WASM_MEMORY_ADDR_LEB,
+                .R_WASM_MEMORY_ADDR_SLEB,
+                .R_WASM_MEMORY_ADDR_I32,
+                .R_WASM_MEMORY_ADDR_LEB64,
+                .R_WASM_MEMORY_ADDR_SLEB64,
+                .R_WASM_MEMORY_ADDR_I64,
+                .R_WASM_MEMORY_ADDR_TLS_SLEB,
+                .R_WASM_MEMORY_ADDR_TLS_SLEB64,
+                .R_WASM_FUNCTION_OFFSET_I32,
+                .R_WASM_SECTION_OFFSET_I32,
+                => true,
+                else => false,
+            };
+        }
+    };
+
+    /// Verifies the relocation type of a given `Relocation` and returns
+    /// true when the relocation references a function call or address to a function.
+    pub fn isFunction(self: Relocation) bool {
+        return switch (self.relocation_type) {
+            .R_WASM_FUNCTION_INDEX_LEB,
+            .R_WASM_TABLE_INDEX_SLEB,
+            => true,
+            else => false,
+        };
+    }
+
+    pub fn format(self: Relocation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("{s} offset=0x{x:0>6} symbol={d}", .{
+            @tagName(self.relocation_type),
+            self.offset,
+            self.index,
+        });
+    }
+};
+
+/// Unlike the `Import` object defined by the wasm spec, and existing
+/// in the std.wasm namespace, this construct saves the 'module name' and 'name'
+/// of the import using offsets into a string table, rather than the slices itself.
+/// This saves us (potentially) 24 bytes per import on 64bit machines.
+pub const Import = struct {
+    module_name: u32,
+    name: u32,
+    kind: std.wasm.Import.Kind,
+};
+
+/// Unlike the `Export` object defined by the wasm spec, and existing
+/// in the std.wasm namespace, this construct saves the 'name'
+/// of the export using offsets into a string table, rather than the slice itself.
+/// This saves us (potentially) 12 bytes per export on 64bit machines.
+pub const Export = struct {
+    name: u32,
+    index: u32,
+    kind: std.wasm.ExternalKind,
+};
+
+pub const SubsectionType = enum(u8) {
+    WASM_SEGMENT_INFO = 5,
+    WASM_INIT_FUNCS = 6,
+    WASM_COMDAT_INFO = 7,
+    WASM_SYMBOL_TABLE = 8,
+};
+
+pub const Alignment = @import("../InternPool.zig").Alignment;
+
+pub const NamedSegment = struct {
+    /// Segment's name, encoded as UTF-8 bytes.
+    name: []const u8,
+    /// The required alignment of the segment, encoded as a power of 2
+    alignment: Alignment,
+    /// Bitfield containing flags for a segment
+    flags: u32,
+
+    pub fn isTLS(segment: NamedSegment) bool {
+        return segment.flags & @intFromEnum(Flags.WASM_SEG_FLAG_TLS) != 0;
+    }
+
+    /// Returns the name as how it will be output into the final object
+    /// file or binary. When `merge_segments` is true, this will return the
+    /// short name. i.e. ".rodata". When false, it returns the entire name instead.
+    pub fn outputName(segment: NamedSegment, merge_segments: bool) []const u8 {
+        if (segment.isTLS()) {
+            return ".tdata";
+        } else if (!merge_segments) {
+            return segment.name;
+        } else if (std.mem.startsWith(u8, segment.name, ".rodata.")) {
+            return ".rodata";
+        } else if (std.mem.startsWith(u8, segment.name, ".text.")) {
+            return ".text";
+        } else if (std.mem.startsWith(u8, segment.name, ".data.")) {
+            return ".data";
+        } else if (std.mem.startsWith(u8, segment.name, ".bss.")) {
+            return ".bss";
+        }
+        return segment.name;
+    }
+
+    pub const Flags = enum(u32) {
+        WASM_SEG_FLAG_STRINGS = 0x1,
+        WASM_SEG_FLAG_TLS = 0x2,
+    };
+};
+
+pub const InitFunc = struct {
+    /// Priority of the init function
+    priority: u32,
+    /// The symbol index of init function (not the function index).
+    symbol_index: u32,
+};
+
+pub const Comdat = struct {
+    name: []const u8,
+    /// Must be zero, no flags are currently defined by the tool-convention.
+    flags: u32,
+    symbols: []const ComdatSym,
+};
+
+pub const ComdatSym = struct {
+    kind: @This().Type,
+    /// Index of the data segment/function/global/event/table within a WASM module.
+    /// The object must not be an import.
+    index: u32,
+
+    pub const Type = enum(u8) {
+        WASM_COMDAT_DATA = 0,
+        WASM_COMDAT_FUNCTION = 1,
+        WASM_COMDAT_GLOBAL = 2,
+        WASM_COMDAT_EVENT = 3,
+        WASM_COMDAT_TABLE = 4,
+        WASM_COMDAT_SECTION = 5,
+    };
+};
+
+pub const Feature = struct {
+    /// Provides information about the usage of the feature.
+    /// - '0x2b' (+): Object uses this feature, and the link fails if feature is not in the allowed set.
+    /// - '0x2d' (-): Object does not use this feature, and the link fails if this feature is in the allowed set.
+    /// - '0x3d' (=): Object uses this feature, and the link fails if this feature is not in the allowed set,
+    /// or if any object does not use this feature.
+    prefix: Prefix,
+    /// Type of the feature, must be unique in the sequence of features.
+    tag: Tag,
+
+    /// Unlike `std.Target.wasm.Feature` this also contains linker-features such as shared-mem
+    pub const Tag = enum {
+        atomics,
+        bulk_memory,
+        exception_handling,
+        extended_const,
+        half_precision,
+        multimemory,
+        multivalue,
+        mutable_globals,
+        nontrapping_fptoint,
+        reference_types,
+        relaxed_simd,
+        sign_ext,
+        simd128,
+        tail_call,
+        shared_mem,
+
+        /// From a given cpu feature, returns its linker feature
+        pub fn fromCpuFeature(feature: std.Target.wasm.Feature) Tag {
+            return @as(Tag, @enumFromInt(@intFromEnum(feature)));
+        }
+
+        pub fn format(tag: Tag, comptime fmt: []const u8, opt: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt;
+            _ = opt;
+            try writer.writeAll(switch (tag) {
+                .atomics => "atomics",
+                .bulk_memory => "bulk-memory",
+                .exception_handling => "exception-handling",
+                .extended_const => "extended-const",
+                .half_precision => "half-precision",
+                .multimemory => "multimemory",
+                .multivalue => "multivalue",
+                .mutable_globals => "mutable-globals",
+                .nontrapping_fptoint => "nontrapping-fptoint",
+                .reference_types => "reference-types",
+                .relaxed_simd => "relaxed-simd",
+                .sign_ext => "sign-ext",
+                .simd128 => "simd128",
+                .tail_call => "tail-call",
+                .shared_mem => "shared-mem",
+            });
+        }
+    };
+
+    pub const Prefix = enum(u8) {
+        used = '+',
+        disallowed = '-',
+        required = '=',
+    };
+
+    pub fn format(feature: Feature, comptime fmt: []const u8, opt: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = opt;
+        _ = fmt;
+        try writer.print("{c} {}", .{ feature.prefix, feature.tag });
+    }
+};
+
+pub const known_features = std.StaticStringMap(Feature.Tag).initComptime(.{
+    .{ "atomics", .atomics },
+    .{ "bulk-memory", .bulk_memory },
+    .{ "exception-handling", .exception_handling },
+    .{ "extended-const", .extended_const },
+    .{ "half-precision", .half_precision },
+    .{ "multimemory", .multimemory },
+    .{ "multivalue", .multivalue },
+    .{ "mutable-globals", .mutable_globals },
+    .{ "nontrapping-fptoint", .nontrapping_fptoint },
+    .{ "reference-types", .reference_types },
+    .{ "relaxed-simd", .relaxed_simd },
+    .{ "sign-ext", .sign_ext },
+    .{ "simd128", .simd128 },
+    .{ "tail-call", .tail_call },
+    .{ "shared-mem", .shared_mem },
+});
